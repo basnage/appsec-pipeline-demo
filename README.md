@@ -1,6 +1,6 @@
 # AppSec Pipeline Demo
 
-**A layered security pipeline in GitHub Actions: secrets, SAST, SCA, IaC, container and DAST scanning, with results normalised into one gate.**
+**A layered security pipeline in GitHub Actions: secrets, SAST, SCA, IaC, container and DAST scanning, with results normalized into one gate.**
 
 > ⚠️ The application in this repo is **intentionally vulnerable**. It exists only so the pipeline has real issues to find. Never deploy it.
 
