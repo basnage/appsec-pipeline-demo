@@ -1,0 +1,305 @@
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 6 * * 1" # weekly: catch newly published CVEs in unchanged code
+
+# Least privilege: nothing by default, each job asks for what it needs.
+permissions: {}
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+# Scanner versions are pinned and every download is checked against a known
+# SHA-256 before it runs. No third-party Marketplace actions are used, so a
+# hijacked action tag cannot inject code into this pipeline. GitHub-owned
+# actions are pinned to full commit SHAs (Dependabot keeps them current).
+env:
+  TRIVY_VERSION: "0.76.2"
+  TRIVY_SHA256: "bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf"
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  OPENGREP_VERSION: "1.33.1"
+  OPENGREP_SHA256: "46e8133cc490f9f50518061590ce2f6be5a08afaeda034471c0ceda4b3899808"
+  ZIZMOR_VERSION: "1.32.0"
+  # Pin this to a digest (ghcr.io/zaproxy/zaproxy@sha256:...) after the first run.
+  ZAP_IMAGE: "ghcr.io/zaproxy/zaproxy:stable"
+  IMAGE: "appsec-demo:${{ github.sha }}"
+
+jobs:
+  # ------------------------------------------------------------------ secrets
+  secrets:
+    name: Secrets (Gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # full history: secrets removed in later commits still count
+          persist-credentials: false
+
+      - name: Install Gitleaks (pinned, checksum verified)
+        run: |
+          curl -sSfL -o gitleaks.tgz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tgz" | sha256sum -c -
+          tar -xzf gitleaks.tgz gitleaks && sudo mv gitleaks /usr/local/bin/
+
+      - name: Scan git history
+        # --redact keeps the secret values out of logs and the SARIF report
+        run: gitleaks git --redact --report-format sarif --report-path gitleaks.sarif --exit-code 0 .
+
+      - uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sarif-gitleaks
+          path: gitleaks.sarif
+
+  # --------------------------------------------------------------------- SAST
+  sast:
+    name: SAST (Opengrep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Opengrep (pinned, checksum verified)
+        run: |
+          curl -sSfL -o opengrep \
+            "https://github.com/opengrep/opengrep/releases/download/v${OPENGREP_VERSION}/opengrep_manylinux_x86"
+          echo "${OPENGREP_SHA256}  opengrep" | sha256sum -c -
+          chmod +x opengrep && sudo mv opengrep /usr/local/bin/
+
+      - name: Unit-test the custom rules
+        # Each rule has positive and negative test cases in rules/*.py.
+        # A broken rule fails the build instead of silently finding nothing.
+        run: opengrep test rules/
+
+      - name: Scan source
+        run: |
+          opengrep scan --config rules/python-flask.yaml --exclude rules \
+            --sarif-output=opengrep.sarif .
+
+      - uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: opengrep.sarif
+          category: opengrep
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sarif-opengrep
+          path: opengrep.sarif
+
+  # ------------------------------------------------------- dependencies + IaC
+  sca-iac:
+    name: Dependencies & IaC (Trivy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Trivy (pinned, checksum verified)
+        run: |
+          curl -sSfL -o trivy.tgz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c -
+          tar -xzf trivy.tgz trivy && sudo mv trivy /usr/local/bin/
+
+      - name: Scan dependencies (SCA)
+        run: trivy fs --scanners vuln --format sarif --output trivy-fs.sarif app/
+
+      - name: Scan Dockerfile and Terraform (IaC)
+        run: trivy config --format sarif --output trivy-iac.sarif .
+
+      - name: Upload dependency results
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-dependencies
+
+      - name: Upload IaC results
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: trivy-iac.sarif
+          category: trivy-iac
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sarif-trivy-fs-iac
+          path: |
+            trivy-fs.sarif
+            trivy-iac.sarif
+
+  # --------------------------------------------------- container image + DAST
+  container-dast:
+    name: Container image (Trivy) & DAST (ZAP)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Trivy (pinned, checksum verified)
+        run: |
+          curl -sSfL -o trivy.tgz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c -
+          tar -xzf trivy.tgz trivy && sudo mv trivy /usr/local/bin/
+
+      - name: Build image
+        run: docker build -t "$IMAGE" .
+
+      - name: Scan image (OS packages + Python libraries)
+        run: trivy image --format sarif --output trivy-image.sarif "$IMAGE"
+
+      - name: Upload image results
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Start the app
+        run: |
+          docker run -d --name app -p 5000:5000 "$IMAGE"
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:5000/health && exit 0
+            sleep 2
+          done
+          docker logs app; exit 1
+
+      - name: ZAP baseline scan (passive)
+        run: |
+          mkdir -p zap && chmod 777 zap
+          # -I: don't fail on warnings; the gate job decides pass/fail
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk:rw" "$ZAP_IMAGE" \
+            zap-baseline.py -t http://localhost:5000 -J zap.json -r zap.html -I
+
+      - name: Summarise ZAP alerts
+        if: always()
+        run: |
+          [ -f zap/zap.json ] || exit 0
+          {
+            echo "## ZAP baseline alerts"
+            echo ""
+            echo "| Risk | Alert | Instances |"
+            echo "|---|---|---:|"
+            jq -r '.site[].alerts[] | [.riskdesc, .name, (.instances | length)] | "| \(.[0]) | \(.[1]) | \(.[2]) |"' zap/zap.json
+            echo ""
+            echo "Full HTML report is attached to this run as the **zap-report** artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop the app
+        if: always()
+        run: docker rm -f app || true
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sarif-trivy-image
+          path: trivy-image.sarif
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: zap-report
+          path: zap/
+
+  # ------------------------------------------------- the pipeline itself
+  workflow-audit:
+    name: Workflow security (zizmor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install zizmor (pinned)
+        run: pip install --quiet "zizmor==${ZIZMOR_VERSION}"
+
+      - name: Audit GitHub Actions workflows
+        # Finds unpinned actions, script injection, over-broad permissions,
+        # credential persistence and similar CI/CD supply-chain issues.
+        env:
+          GH_TOKEN: ${{ github.token }} # enables online checks (impostor commits, known-vulnerable actions)
+        run: zizmor --format sarif .github/ > zizmor.sarif || true
+
+      - uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sarif-zizmor
+          path: zizmor.sarif
+
+  # --------------------------------------------------------------------- gate
+  gate:
+    name: Security gate
+    needs: [secrets, sast, sca-iac, container-dast, workflow-audit]
+    if: always() # still report if one scanner job failed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: sarif-*
+          path: reports
+          merge-multiple: true
+
+      - name: Evaluate findings
+        # Repository variables (Settings > Secrets and variables > Actions > Variables):
+        #   SECURITY_GATE_ENFORCE = true  -> fail the build on blocking findings
+        #   SECURITY_GATE_FAIL_ON = critical|high|medium|low (default high)
+        # Values are passed through env, never interpolated into the script,
+        # to avoid workflow script injection.
+        env:
+          ENFORCE: ${{ vars.SECURITY_GATE_ENFORCE }}
+          FAIL_ON: ${{ vars.SECURITY_GATE_FAIL_ON || 'high' }}
+          SCANNER_RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          args=(--fail-on "$FAIL_ON" --summary "$GITHUB_STEP_SUMMARY")
+          [ "$ENFORCE" = "true" ] && args+=(--enforce)
+          python3 scripts/sarif_gate.py reports/*.sarif "${args[@]}"
+          # A scanner that crashed must not look like a clean scan.
+          for r in $SCANNER_RESULTS; do
+            if [ "$r" != "success" ]; then
+              echo "::error::A scanner job did not succeed ($SCANNER_RESULTS)"
+              exit 1
+            fi
+          done

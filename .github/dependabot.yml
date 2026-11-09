@@ -1,0 +1,13 @@
+# Keeps the SHA-pinned GitHub Actions current. pip and Docker updates are
+# deliberately NOT enabled: the outdated dependencies are the point of the demo.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7 # let new releases age a week before adopting them
+    groups:
+      actions:
+        patterns: ["*"]

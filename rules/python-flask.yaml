@@ -1,0 +1,165 @@
+rules:
+  # ---------------------------------------------------------------- injection
+  - id: flask-sqli-formatted-query
+    languages: [python]
+    severity: ERROR
+    message: >-
+      SQL query is built with string formatting. If any part comes from user
+      input this is SQL injection. Use parameterized queries:
+      cursor.execute("... WHERE id = ?", (user_id,)).
+    metadata:
+      cwe: "CWE-89: SQL Injection"
+      owasp: "A03:2021 - Injection"
+      confidence: MEDIUM
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/Query_Parameterization_Cheat_Sheet.html
+    patterns:
+      - pattern-either:
+          - pattern: $DB.execute(f"...", ...)
+          - pattern: $DB.execute("..." % $X, ...)
+          - pattern: $DB.execute("..." + $X, ...)
+          - pattern: $DB.execute("...".format(...), ...)
+          - pattern: $DB.executemany(f"...", ...)
+
+  - id: flask-command-injection-shell-true
+    languages: [python]
+    severity: ERROR
+    mode: taint
+    message: >-
+      Request data reaches a subprocess call that runs through a shell.
+      This is OS command injection. Pass an argument list and drop shell=True.
+    metadata:
+      cwe: "CWE-78: OS Command Injection"
+      owasp: "A03:2021 - Injection"
+      confidence: HIGH
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/OS_Command_Injection_Defense_Cheat_Sheet.html
+    pattern-sources:
+      - pattern-either:
+          - pattern: flask.request.$ATTR
+          - pattern: flask.request.$ATTR.get(...)
+          - pattern: flask.request.get_data(...)
+          - pattern: flask.request.get_json(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: subprocess.$FUNC($CMD, ..., shell=True, ...)
+              - pattern: os.system($CMD)
+              - pattern: os.popen($CMD, ...)
+          - focus-metavariable: $CMD
+
+  - id: flask-ssrf-requests
+    languages: [python]
+    severity: ERROR
+    mode: taint
+    message: >-
+      Request data controls the URL of an outbound HTTP request (SSRF).
+      Validate against an allow-list of hosts and block internal/metadata
+      addresses such as 169.254.169.254.
+    metadata:
+      cwe: "CWE-918: Server-Side Request Forgery"
+      owasp: "A10:2021 - Server-Side Request Forgery"
+      confidence: MEDIUM
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+    pattern-sources:
+      - pattern-either:
+          - pattern: flask.request.$ATTR
+          - pattern: flask.request.$ATTR.get(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: requests.$METHOD($URL, ...)
+              - pattern: urllib.request.urlopen($URL, ...)
+          - focus-metavariable: $URL
+
+  - id: flask-ssti-render-template-string
+    languages: [python]
+    severity: ERROR
+    message: >-
+      render_template_string() is called with a dynamically built template.
+      User input in the template source allows server-side template injection
+      (often remote code execution). Use a static template and pass values as
+      context variables.
+    metadata:
+      cwe: "CWE-1336: Server-Side Template Injection"
+      owasp: "A03:2021 - Injection"
+      confidence: HIGH
+      references:
+        - https://portswigger.net/web-security/server-side-template-injection
+    patterns:
+      - pattern-either:
+          - pattern: flask.render_template_string(f"...", ...)
+          - pattern: flask.render_template_string("..." % $X, ...)
+          - pattern: flask.render_template_string("..." + $X, ...)
+          - pattern: flask.render_template_string("...".format(...), ...)
+
+  # --------------------------------------------------------- deserialization
+  - id: python-unsafe-yaml-load
+    languages: [python]
+    severity: ERROR
+    message: >-
+      yaml.load() with an unsafe Loader can construct arbitrary Python
+      objects. Use yaml.safe_load().
+    metadata:
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      owasp: "A08:2021 - Software and Data Integrity Failures"
+      confidence: HIGH
+      references:
+        - https://pyyaml.org/wiki/PyYAMLDocumentation
+    pattern-either:
+      - pattern: yaml.load($DATA)
+      - pattern: yaml.load($DATA, Loader=yaml.Loader)
+      - pattern: yaml.load($DATA, Loader=yaml.UnsafeLoader)
+      - pattern: yaml.load($DATA, Loader=yaml.FullLoader)
+      - pattern: yaml.unsafe_load(...)
+
+  - id: python-pickle-loads
+    languages: [python]
+    severity: WARNING
+    message: >-
+      pickle can execute arbitrary code during deserialization. Never unpickle
+      data that crosses a trust boundary; use JSON or a signed format instead.
+    metadata:
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      owasp: "A08:2021 - Software and Data Integrity Failures"
+      confidence: MEDIUM
+      references:
+        - https://docs.python.org/3/library/pickle.html
+    pattern-either:
+      - pattern: pickle.loads(...)
+      - pattern: pickle.load(...)
+      - pattern: cPickle.loads(...)
+
+  # ------------------------------------------------------------ configuration
+  - id: flask-debug-enabled
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Flask debug mode exposes the Werkzeug interactive debugger, which allows
+      code execution. Load debug settings from the environment and keep them
+      off in production.
+    metadata:
+      cwe: "CWE-489: Active Debug Code"
+      owasp: "A05:2021 - Security Misconfiguration"
+      confidence: HIGH
+      references:
+        - https://flask.palletsprojects.com/en/latest/debugging/
+    pattern: $APP.run(..., debug=True, ...)
+
+  - id: flask-hardcoded-secret-key
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Flask SECRET_KEY is hard-coded. Anyone with the source can forge session
+      cookies. Load it from a secret manager or environment variable.
+    metadata:
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      owasp: "A07:2021 - Identification and Authentication Failures"
+      confidence: HIGH
+      references:
+        - https://flask.palletsprojects.com/en/latest/config/#SECRET_KEY
+    pattern-either:
+      - pattern: $APP.config["SECRET_KEY"] = "..."
+      - pattern: $APP.secret_key = "..."
+      - pattern: $APP.config.update(..., SECRET_KEY="...", ...)
